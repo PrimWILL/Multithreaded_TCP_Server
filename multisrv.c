@@ -1,0 +1,284 @@
+/* file: echosrv.c
+
+   Bare-bones single-threaded TCP server. Listens for connections
+   on "ephemeral" socket, assigned dynamically by the OS.
+
+   This started out with an example in W. Richard Stevens' book
+   "Advanced Programming in the Unix Environment".  I have
+   modified it quite a bit, including changes to make use of my
+   own re-entrant version of functions in echolib.
+
+   NOTE: See comments starting with "NOTE:" for indications of
+   places where code needs to be added to make this multithreaded.
+   Remove those comments from your solution before turning it in,
+   and replace them by comments explaining the parts you have
+   changed.
+
+   Ted Baker
+   February 2015
+
+ */
+
+#include "config.h"
+#include "pthread.h"
+#include "echolib.h"
+#include "checks.h"
+
+/* thread pool 생성을 위한 data structure 관련 코드 여기서는 data structure로 queue를 선택 */
+
+pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
+pthread_cond_t condition_var = PTHREAD_COND_INITIALIZER;
+
+struct node {
+  struct node* next;
+  int *client_socket;
+};
+
+typedef struct node node_t;
+
+node_t* server_head = NULL;
+node_t* server_tail = NULL;
+
+void enqueue(int *client_socket, node_t** head, node_t** tail) {
+  node_t *newnode = malloc(sizeof(node_t));
+  newnode->client_socket = client_socket;
+  newnode->next = NULL;
+  
+  if (*tail == NULL) { *head = newnode; } 
+  else { (*tail)->next = newnode; }
+
+  *tail = newnode;
+}
+
+int* dequeue(node_t** head, node_t** tail) {
+  if (*head == NULL) { return NULL; }
+  else {
+    int *result = (*head)->client_socket;
+    node_t *temp = *head;
+    *head = (*head)->next;
+
+    if (*head == NULL) { *tail = NULL; }
+    free(temp);
+
+    return result;
+  }
+}
+
+/* thread pool 관리를 위한 counter */
+int counter; // decrement counter
+
+/* connection threads 관리를 위한 data structure*/
+node_t* connection_head = NULL;
+node_t* connection_tail = NULL;
+
+void serve_connection (int sockfd);
+
+void server_handoff (int sockfd) {
+
+  int *pclient = malloc(sizeof(int));
+  *pclient = sockfd;
+
+  connection_t conn;
+  connection_init (&conn);
+  conn.sockfd = sockfd;
+
+  /* client와 server thread의 연결을 위한 queue 관리 
+  *  이때, 각 thread에서 queue에 동시에 접근하는 것을 막기 위해 mutex를 사용함
+  *  또한, conditional variable을 사용하여 thread의 동작 흐름을 제어함
+  */
+  pthread_mutex_lock(&mutex);
+  if (counter > 0)
+    enqueue(pclient, &server_head, &server_tail);
+  else {
+    /* 현재 연결 가능한 threads가 없을 경우, connection queue에서 대기 */
+    enqueue(pclient, &connection_head, &connection_tail);
+  }
+  pthread_cond_signal(&condition_var);
+  pthread_mutex_unlock(&mutex);
+}
+
+/* 입력받은 number를 소수판별하여 client에게 돌려주는 코드 */
+int isPrime(int num){
+  int i;
+  if (num == 0 || num == 1) { return 0; }
+  if (num == 2 || num == 3) { return 1; }
+  for (i = 2; i <= num / 2; i++) {
+    if (num % i == 0) return 0;
+  }
+  return 1;
+}
+
+/* the main per-connection service loop of the server; assumes
+   sockfd is a connected socket */
+void serve_connection (int sockfd) {
+  ssize_t  n, result;
+  char line[MAXLINE];
+  char newline[MAXLINE];
+
+  connection_t conn;
+  connection_init (&conn);
+  conn.sockfd = sockfd;
+  char *ptr;
+
+  while (! shutting_down) {
+    if ((n = readline (&conn, line, MAXLINE)) == 0) goto quit;
+    /* connection closed by other end */
+    if (shutting_down) goto quit;
+    if (n < 0) {
+      perror ("readline failed");
+      goto quit;
+    }
+
+    newline[0] = '\0';
+    ptr = strtok(line, " ");
+    while (ptr != NULL)               
+    {   
+        if(*ptr<48 || *ptr >57){
+          strcat(newline, "invalied input");
+          break;
+        }
+        if(isPrime(atoi(ptr))==1) strcat(newline, "prime ");
+        else strcat(newline, "non-prime ");
+        ptr = strtok(NULL, " ");      
+    }
+    strcat(newline, "\n");
+
+    result = writen (&conn, newline, strlen(newline));
+    if (shutting_down) goto quit;
+    if(result == -1){
+      printf("error!\n");
+      goto quit;
+    }
+  }
+quit:
+  CHECK (close (conn.sockfd));
+}
+
+/* set up socket to use in listening for connections */
+void open_listening_socket (int *listenfd) {
+  struct sockaddr_in servaddr;
+  const int server_port = 0; /* use ephemeral port number */
+
+  socklen_t namelen;
+  memset (&servaddr, 0, sizeof(struct sockaddr_in));
+
+  servaddr.sin_family = AF_INET;
+  /* htons translates host byte order to network byte order; ntohs
+     translates network byte order to host byte order */
+  servaddr.sin_addr.s_addr = htonl (INADDR_ANY);
+  servaddr.sin_port = htons (server_port);
+
+  /* create the socket */
+  CHECK (*listenfd = socket(AF_INET, SOCK_STREAM, 0))
+
+  /* bind it to the ephemeral port number */
+  CHECK (bind (*listenfd, (struct sockaddr *) &servaddr, sizeof (servaddr)));
+
+  /* extract the ephemeral port number, and put it out */
+  namelen = sizeof (servaddr);
+  CHECK (getsockname (*listenfd, (struct sockaddr *) &servaddr, &namelen));
+  fprintf (stderr, "server using port %d\n", ntohs(servaddr.sin_port));
+}
+
+/* handler for SIGINT, the signal conventionally generated by the
+   control-C key at a Unix console, to allow us to shut down
+   gently rather than having the entire process killed abruptly. */ 
+void siginthandler (int sig, siginfo_t *info, void *ignored) {
+  shutting_down = 1;
+}
+
+void install_siginthandler () {
+  struct sigaction act;
+  /* get current action for SIGINT */
+  CHECK (sigaction (SIGINT, NULL, &act));
+  /* add our handler */
+  act.sa_sigaction = siginthandler;
+  /* update action for SIGINT */
+  CHECK (sigaction (SIGINT, &act, NULL));
+}
+
+void* thread_function(void *arg) {
+  while (1) {
+    int *pclient;
+    pthread_mutex_lock(&mutex);
+    if ((pclient = dequeue(&server_head, &server_tail)) == NULL) {
+      pthread_cond_wait(&condition_var, &mutex);
+      pclient = dequeue(&server_head, &server_tail);
+    }
+    /* process thread가 하나 생겼을 경우, 현재 연결 가능한 thread 수를 나타내는 counter를 1만큼 감소 */
+    counter--;
+    printf("num of counter : %d\n", counter);
+    pthread_mutex_unlock(&mutex);
+
+    if (pclient != NULL) {
+      serve_connection(*pclient);
+
+      /* connection이 끊기면 현재 연결 가능한 thread 수를 나타내는 counter를 1만큼 중가 */
+      pthread_mutex_lock(&mutex);
+      counter++;
+      printf("num of counter after serve_connection : %d\n", counter);
+      /* connection이 끊겼을 때, 현재 connection을 위해 대기하고 있는 client가 있는 경우 server queue로 이동*/
+      if ((pclient = dequeue(&connection_head, &connection_tail)) != NULL) {
+        enqueue(pclient, &server_head, &server_tail);
+      }
+      pthread_mutex_unlock(&mutex);
+    }
+  }
+}
+
+int main (int argc, char **argv) {
+  int connfd, listenfd;
+  socklen_t clilen;
+  struct sockaddr_in cliaddr;
+
+  int ch;
+  int threads_size = 0;
+  
+  while ((ch = getopt(argc, argv, "n:")) != -1) {
+    switch(ch) {
+      case 'n':
+        for (int i = 0; i < argc; i++)
+          threads_size += atoi(argv[i]);
+        break;
+      case '?':
+        if (optopt == 'n')
+          fprintf(stderr, "Option -%c requires an argumet.\n", optopt);
+        else if (isprint(optopt))
+          fprintf(stderr, "Unkown option `-%c`.\n", optopt);
+        else
+          fprintf(stderr, "Unknown option character `\\x%x.`\n", optopt);
+        return 1;
+      default:
+        abort();
+    }
+  }
+
+  printf("n_value: %d\n", threads_size);
+
+  /* multi threading을 위한 thread pool 생성 */
+  pthread_t thread_pool[threads_size];
+
+  for (int i = 0; i < threads_size; i++) {
+    pthread_create(&thread_pool[i], NULL, thread_function, NULL);
+  }
+
+  counter = threads_size;
+
+  install_siginthandler();
+  open_listening_socket (&listenfd);
+  CHECK (listen (listenfd, 4));
+
+  /* allow up to 4 queued connection requests before refusing */
+  while (! shutting_down) {
+    errno = 0;
+    clilen = sizeof (cliaddr); /* length of address can vary, by protocol */
+    if ((connfd = accept (listenfd, (struct sockaddr *) &cliaddr, &clilen)) < 0) {
+      if (errno != EINTR) ERR_QUIT ("accept"); 
+      /* otherwise try again, unless we are shutting down */
+    } else {
+     server_handoff (connfd); /* process the connection */
+    }
+  }
+  CHECK (close (listenfd));
+  return 0;
+}
